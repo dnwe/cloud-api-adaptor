@@ -48,6 +48,10 @@ type ServerConfig struct {
 	RootVolumeSize          int
 	EnableScratchSpace      bool
 	DeveloperMode           bool
+	// TLSMaterialPath is the path where TLS material is persisted across
+	// CAA process restarts. Must survive process restarts (tmpfs is fine).
+	// Default: /run/peerpod/tls-material.json
+	TLSMaterialPath string
 }
 
 var logger = log.New(log.Writer(), "[adaptor/cloud] ", log.LstdFlags|log.Lmsgprefix)
