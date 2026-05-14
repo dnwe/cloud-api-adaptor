@@ -119,6 +119,10 @@ providerConfigs:
     # (default: "")
     # TLS_CIPHER_SUITES: ""
 
+    # Path to persist TLS material across CAA restarts
+    # (default: "/run/peerpod/tls-material.json")
+    # TLS_MATERIAL_PATH: "/run/peerpod/tls-material.json"
+
     # Minimum TLS version for peer pod connections (VersionTLS12 or VersionTLS13)
     # (default: "")
     # TLS_MIN_VERSION: ""
