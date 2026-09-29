@@ -34,6 +34,8 @@ import (
 
 const (
 	Version = "0.0.0"
+
+	startLockPollInterval = time.Second
 )
 
 type ServerConfig struct {
@@ -218,8 +220,64 @@ func (s *cloudService) restoreSandbox(ctx context.Context, sid string) {
 		return
 	}
 
+	lock, err := s.stateManager.TryLock(sid)
+	if errors.Is(err, state.ErrLocked) {
+		// another CAA is still in StartVM for this sandbox, as during a
+		// rolling update where both run at once
+		logger.Printf("sandbox %s is being started by another process, waiting", sid)
+		go s.restoreWhenUnlocked(ctx, sid)
+		return
+	}
+	if err != nil {
+		logger.Printf("failed to lock %s: %v", sid, err)
+	} else {
+		defer lock.Close()
+	}
+
 	logger.Printf("cleaning up incomplete sandbox %s", sid)
 	s.cleanupSandboxState(sid, st)
+}
+
+// restoreWhenUnlocked restores sid once the process starting it has finished
+// or exited.
+func (s *cloudService) restoreWhenUnlocked(ctx context.Context, sid string) {
+	ticker := time.NewTicker(startLockPollInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+		}
+
+		lock, err := s.stateManager.TryLock(sid)
+		if errors.Is(err, state.ErrLocked) {
+			continue
+		}
+		if err != nil {
+			// the pod directory is gone if the other process stopped the sandbox
+			if !errors.Is(err, os.ErrNotExist) {
+				logger.Printf("failed to lock %s: %v", sid, err)
+			}
+			return
+		}
+		lock.Close()
+
+		s.restoreSandbox(ctx, sid)
+		return
+	}
+}
+
+func (s *cloudService) releaseStartLock(sb *sandbox) {
+	s.mutex.Lock()
+	lock := sb.startLock
+	sb.startLock = nil
+	s.mutex.Unlock()
+
+	if lock != nil {
+		lock.Close()
+	}
 }
 
 func (s *cloudService) cleanupSandboxState(sid string, st *state.SandboxState) {
@@ -536,6 +594,14 @@ func (s *cloudService) CreateVM(ctx context.Context, req *pb.CreateVMRequest) (r
 		logger.Printf("state save for %s failed (non-fatal): %v", sid, err)
 	}
 
+	startLock, lockErr := s.stateManager.TryLock(string(sid))
+	if lockErr != nil {
+		logger.Printf("start lock for %s failed (non-fatal): %v", sid, lockErr)
+	}
+	s.mutex.Lock()
+	sandbox.startLock = startLock
+	s.mutex.Unlock()
+
 	logger.Printf("create a sandbox %s for pod %s in namespace %s (netns: %s)", req.Id, pod, namespace, sandbox.netNSPath)
 
 	return &pb.CreateVMResponse{AgentSocketPath: socketPath}, nil
@@ -643,6 +709,7 @@ func (s *cloudService) StartVM(ctx context.Context, req *pb.StartVMRequest) (res
 	if err := s.stateManager.SetReady(string(sid), sandbox.podNetwork); err != nil {
 		logger.Printf("failed to mark sandbox as ready: %v", err)
 	}
+	s.releaseStartLock(sandbox)
 
 	logger.Print("agent proxy is ready")
 
@@ -692,6 +759,7 @@ func (s *cloudService) StopVM(ctx context.Context, req *pb.StopVMRequest) (*pb.S
 	if err = s.stateManager.Delete(string(sid)); err != nil {
 		logger.Printf("state delete for %s failed (non-fatal): %v", sid, err)
 	}
+	s.releaseStartLock(sandbox)
 
 	return &pb.StopVMResponse{}, nil
 }

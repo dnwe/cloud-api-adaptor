@@ -5,6 +5,7 @@ package cloud
 
 import (
 	"context"
+	"os"
 	"sync"
 
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/adaptor/k8sops"
@@ -50,4 +51,7 @@ type sandbox struct {
 	netNSPath    string
 	spec         provider.InstanceTypeSpec
 	restored     bool // True if sandbox was restored after CAA restart
+
+	// held until the sandbox is running; see state.Manager.TryLock
+	startLock *os.File
 }

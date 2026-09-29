@@ -74,6 +74,29 @@ func TestDelete(t *testing.T) {
 	assert.Error(t, err)
 }
 
+func TestTryLock(t *testing.T) {
+	t.Run("reports another holder until it releases the lock", func(t *testing.T) {
+		m := setupManager(t, "sandbox-1")
+		held, err := m.TryLock("sandbox-1")
+		require.NoError(t, err)
+
+		_, err = m.TryLock("sandbox-1")
+		assert.ErrorIs(t, err, ErrLocked)
+
+		require.NoError(t, held.Close())
+		lock, err := m.TryLock("sandbox-1")
+		require.NoError(t, err)
+		assert.NoError(t, lock.Close())
+	})
+
+	t.Run("fails when the sandbox directory does not exist", func(t *testing.T) {
+		m := NewManager(t.TempDir())
+
+		_, err := m.TryLock("does-not-exist")
+		assert.ErrorIs(t, err, os.ErrNotExist)
+	})
+}
+
 func TestList(t *testing.T) {
 	podsDir := t.TempDir()
 	m := NewManager(podsDir)

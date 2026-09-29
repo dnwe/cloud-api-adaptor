@@ -2,15 +2,23 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"net/netip"
 	"os"
 	"path/filepath"
 	"time"
 
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/podnetwork/tunneler"
+	"golang.org/x/sys/unix"
 )
 
-const stateFileName = "state.json"
+const (
+	stateFileName     = "state.json"
+	startLockFileName = "start.lock"
+)
+
+// ErrLocked is returned by TryLock when another process holds the sandbox lock.
+var ErrLocked = errors.New("sandbox is locked by another process")
 
 type Manager struct {
 	podsDir string
@@ -52,6 +60,26 @@ func (m *Manager) Load(sandboxID string) (*SandboxState, error) {
 
 func (m *Manager) Delete(sandboxID string) error {
 	return os.RemoveAll(filepath.Join(m.podsDir, sandboxID))
+}
+
+// TryLock takes an exclusive lock on the sandbox without blocking and returns
+// ErrLocked if another process holds it. A CAA holds the lock from CreateVM
+// until the sandbox is running, and the kernel drops it if that process exits,
+// so a CAA recovering sandboxes can tell one that another CAA is still starting
+// from one abandoned mid-start. Close the returned file to release the lock.
+func (m *Manager) TryLock(sandboxID string) (*os.File, error) {
+	f, err := os.OpenFile(filepath.Join(m.podsDir, sandboxID, startLockFileName), os.O_RDWR|os.O_CREATE, 0o600)
+	if err != nil {
+		return nil, err
+	}
+	if err := unix.Flock(int(f.Fd()), unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		f.Close()
+		if errors.Is(err, unix.EWOULDBLOCK) {
+			return nil, ErrLocked
+		}
+		return nil, err
+	}
+	return f, nil
 }
 
 func (m *Manager) List() ([]string, error) {
