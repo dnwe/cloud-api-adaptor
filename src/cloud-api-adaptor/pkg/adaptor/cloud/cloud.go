@@ -328,14 +328,21 @@ func (s *cloudService) Teardown() error {
 	}
 	s.mutex.Unlock()
 
+	// drain in parallel; each drain can take up to proxy.DrainTimeout and the
+	// shim only retries its agent connection for a few minutes
+	var wg sync.WaitGroup
 	for _, sb := range sandboxes {
-		if sb.agentProxy != nil {
+		if sb.agentProxy == nil {
+			continue
+		}
+		wg.Go(func() {
 			logger.Printf("draining sandbox %s", sb.id)
 			if err := sb.agentProxy.Shutdown(); err != nil {
 				logger.Printf("error shutting down agent proxy for sandbox %s: %v", sb.id, err)
 			}
-		}
+		})
 	}
+	wg.Wait()
 
 	return s.provider.Teardown()
 }
