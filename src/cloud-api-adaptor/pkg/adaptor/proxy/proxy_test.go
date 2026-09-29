@@ -133,6 +133,37 @@ func TestStartStop(t *testing.T) {
 		assert.NoError(t, err, "expect no error from proxy channel")
 	default:
 	}
+
+	// a successor on the same path, as after a CAA restart, must keep serving
+	// once the original proxy shuts down
+	successor := NewAgentProxy(testServerNamePodVM, socketPath, "", nil, nil, testTimeout5SecondProxy)
+	successorErrCh := make(chan error)
+	go func() {
+		defer close(successorErrCh)
+		if err := successor.Start(context.Background(), serverURL); err != nil {
+			successorErrCh <- err
+		}
+	}()
+	defer func() {
+		require.NoError(t, successor.Shutdown(), "expect no error during successor shutdown")
+	}()
+
+	select {
+	case err := <-successorErrCh:
+		require.NoError(t, err, "expect no error from successor proxy")
+	case <-successor.Ready():
+	}
+
+	require.NoError(t, ttrpcClient.Close(), "expect no error closing client")
+	require.NoError(t, p.Shutdown(), "expect no error during shutdown")
+
+	conn, err = net.Dial(testNetworkUnix, socketPath)
+	require.NoError(t, err, "expect successor socket to remain after original shutdown")
+
+	successorClient := pb.NewAgentServiceClient(ttrpc.NewClient(conn))
+	res, err := successorClient.CreateContainer(context.Background(), &pb.CreateContainerRequest{ContainerId: testContainerIDProxy, OCI: &pb.Spec{Annotations: map[string]string{testAnnotationKeyProxy: testAnnotationValueProxy}}})
+	assert.NoError(t, err, "expect no error creating container through successor")
+	assert.NotNil(t, res, "expect non nil response from successor")
 }
 
 func TestDialerSuccess(t *testing.T) {

@@ -149,6 +149,12 @@ func (p *agentProxy) Start(ctx context.Context, serverURL *url.URL) error {
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", p.socketPath, err)
 	}
+	// during a rolling restart the new CAA listens on the same path before the
+	// old one shuts down; unlinking on close would delete the new socket and
+	// leave the shim unable to reconnect. StopVM removes the pod directory.
+	if ul, ok := listener.(*net.UnixListener); ok {
+		ul.SetUnlinkOnClose(false)
+	}
 
 	dialer := func(ctx context.Context) (net.Conn, error) {
 		return p.dial(ctx, serverURL.Host)
