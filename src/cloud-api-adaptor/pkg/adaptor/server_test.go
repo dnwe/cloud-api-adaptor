@@ -16,11 +16,14 @@ import (
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/adaptor/cloud"
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/adaptor/proxy"
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/podnetwork/tunneler"
+	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-api-adaptor/pkg/util/tlsutil"
 	provider "github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers"
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers/util/cloudinit"
 	"github.com/containerd/containerd/pkg/cri/annotations"
 	"github.com/containerd/ttrpc"
 	"github.com/google/uuid"
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
 	pb "github.com/kata-containers/kata-containers/src/runtime/protocols/hypervisor"
 	agent "github.com/kata-containers/kata-containers/src/runtime/virtcontainers/pkg/agent/protocols/grpc"
@@ -35,6 +38,51 @@ func TestServerStartAndShutdown(t *testing.T) {
 	if _, err := client.Version(context.Background(), &pb.VersionRequest{}); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestBuildAgentFactory(t *testing.T) {
+	build := func(t *testing.T, tlsConfig *tlsutil.TLSConfig, materialPath string) proxy.AgentProxy {
+		t.Helper()
+		factory, err := buildAgentFactory(&cloud.ServerConfig{TLSConfig: tlsConfig, TLSMaterialPath: materialPath})
+		require.NoError(t, err)
+		return factory.New("podvm", filepath.Join(t.TempDir(), "agent.ttrpc"))
+	}
+
+	t.Run("reuses persisted material across restarts", func(t *testing.T) {
+		materialPath := filepath.Join(t.TempDir(), "tls-material.json")
+
+		first := &tlsutil.TLSConfig{}
+		firstProxy := build(t, first, materialPath)
+		second := &tlsutil.TLSConfig{}
+		secondProxy := build(t, second, materialPath)
+
+		require.NotEmpty(t, first.CAData)
+		assert.Equal(t, first.CAData, second.CAData)
+		assert.Equal(t, first.CertData, second.CertData)
+		assert.Equal(t, firstProxy.CAService().RootCertificate(), secondProxy.CAService().RootCertificate())
+	})
+
+	t.Run("keeps configured certificate files", func(t *testing.T) {
+		tlsConfig := &tlsutil.TLSConfig{CAFile: "/etc/certificates/ca.crt", CertFile: "/etc/certificates/client.crt", KeyFile: "/etc/certificates/client.key"}
+
+		agentProxy := build(t, tlsConfig, filepath.Join(t.TempDir(), "tls-material.json"))
+
+		assert.Nil(t, tlsConfig.CAData)
+		assert.Nil(t, tlsConfig.CertData)
+		assert.Nil(t, tlsConfig.KeyData)
+		assert.Nil(t, agentProxy.CAService())
+	})
+
+	t.Run("persists only the CA when the client certificate is configured", func(t *testing.T) {
+		tlsConfig := &tlsutil.TLSConfig{CertFile: "/etc/certificates/client.crt", KeyFile: "/etc/certificates/client.key"}
+
+		agentProxy := build(t, tlsConfig, filepath.Join(t.TempDir(), "tls-material.json"))
+
+		assert.Nil(t, tlsConfig.CertData)
+		assert.Nil(t, tlsConfig.KeyData)
+		require.NotNil(t, agentProxy.CAService())
+		assert.Equal(t, agentProxy.CAService().RootCertificate(), tlsConfig.CAData)
+	})
 }
 
 func TestCreateStartAndStop(t *testing.T) {

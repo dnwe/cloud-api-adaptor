@@ -54,20 +54,31 @@ type server struct {
 }
 
 // buildAgentFactory constructs a proxy.Factory, using persistent TLS material
-// when configured, falling back to ephemeral material otherwise.
+// when configured, falling back to ephemeral material otherwise. Persistent
+// material only stands in for the client certificate and CA that
+// proxy.NewFactory would otherwise generate; configured files are kept.
 func buildAgentFactory(cfg *cloud.ServerConfig) (proxy.Factory, error) {
-	if cfg.TLSConfig != nil && cfg.TLSMaterialPath != "" {
-		caService, clientCertPEM, clientKeyPEM, err := tlsutil.LoadOrCreateTLSMaterial(cfg.TLSMaterialPath)
-		if err != nil {
-			return nil, fmt.Errorf("failed to load/create TLS material from %s: %w", cfg.TLSMaterialPath, err)
-		}
-		cfg.TLSConfig.CertData = clientCertPEM
-		cfg.TLSConfig.KeyData = clientKeyPEM
-		cfg.TLSConfig.CAData = caService.RootCertificate()
-		logger.Printf("using persistent TLS material from %s", cfg.TLSMaterialPath)
-		return proxy.NewFactoryWithCAService(cfg.PauseImage, cfg.TLSConfig, cfg.ProxyTimeout, caService), nil
+	tlsConfig := cfg.TLSConfig
+	if tlsConfig == nil || cfg.TLSMaterialPath == "" || (tlsConfig.HasCertAuth() && tlsConfig.HasCA()) {
+		return proxy.NewFactory(cfg.PauseImage, tlsConfig, cfg.ProxyTimeout), nil
 	}
-	return proxy.NewFactory(cfg.PauseImage, cfg.TLSConfig, cfg.ProxyTimeout), nil
+
+	persistedCA, clientCertPEM, clientKeyPEM, err := tlsutil.LoadOrCreateTLSMaterial(cfg.TLSMaterialPath)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load/create TLS material from %s: %w", cfg.TLSMaterialPath, err)
+	}
+	logger.Printf("using persistent TLS material from %s", cfg.TLSMaterialPath)
+
+	if !tlsConfig.HasCertAuth() {
+		tlsConfig.CertData = clientCertPEM
+		tlsConfig.KeyData = clientKeyPEM
+	}
+	var caService tlsutil.CAService
+	if !tlsConfig.HasCA() {
+		caService = persistedCA
+		tlsConfig.CAData = caService.RootCertificate()
+	}
+	return proxy.NewFactoryWithCAService(cfg.PauseImage, tlsConfig, cfg.ProxyTimeout, caService), nil
 }
 
 func NewServer(provider provider.Provider, cfg *cloud.ServerConfig, workerNode podnetwork.WorkerNode) (Server, error) {

@@ -65,7 +65,13 @@ func LoadOrCreateTLSMaterial(path string) (CAService, []byte, []byte, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return nil, nil, nil, fmt.Errorf("creating TLS material directory: %w", err)
 	}
-	if err := os.WriteFile(path, data, 0o600); err != nil {
+	// write and rename so a crash never leaves a partial file, which the
+	// next start would replace with a new CA that existing pod VMs reject
+	tmpPath := path + ".tmp"
+	if err := os.WriteFile(tmpPath, data, 0o600); err != nil {
+		return nil, nil, nil, fmt.Errorf("writing TLS material: %w", err)
+	}
+	if err := os.Rename(tmpPath, path); err != nil {
 		return nil, nil, nil, fmt.Errorf("writing TLS material: %w", err)
 	}
 
