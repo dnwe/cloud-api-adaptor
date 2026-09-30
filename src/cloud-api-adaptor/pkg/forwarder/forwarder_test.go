@@ -5,6 +5,7 @@ package forwarder
 
 import (
 	"context"
+	"crypto/tls"
 	"encoding/json"
 	"net"
 	"testing"
@@ -693,68 +694,89 @@ func TestDaemonWithTLSConfig(t *testing.T) {
 	})
 }
 
-func TestSingleClientListenerFirstAccept(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
+func TestSingleClientListener(t *testing.T) {
+	// connect returns both ends of a connection; wrap can layer TLS over the
+	// client, which handshakes on its first write
+	connect := func(t *testing.T, ln net.Listener, scl net.Listener, wrap func(net.Conn) net.Conn) (client, server net.Conn) {
+		t.Helper()
+		conn, err := net.Dial("tcp", ln.Addr().String())
+		require.NoError(t, err)
+		client = wrap(conn)
+		t.Cleanup(func() { client.Close() })
 
-	scl := newSingleClientListener(ln)
-
-	conn, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn.Close()
-
-	accepted, err := scl.Accept()
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer accepted.Close()
-
-	if accepted == nil {
-		t.Fatal("expected non-nil connection")
-	}
-}
-
-func TestSingleClientListenerReplacesConnection(t *testing.T) {
-	ln, err := net.Listen("tcp", "127.0.0.1:0")
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer ln.Close()
-
-	scl := newSingleClientListener(ln)
-
-	conn1, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn1.Close()
-
-	accepted1, err := scl.Accept()
-	if err != nil {
-		t.Fatal(err)
+		server, err = scl.Accept()
+		require.NoError(t, err)
+		t.Cleanup(func() { server.Close() })
+		return client, server
 	}
 
-	conn2, err := net.Dial("tcp", ln.Addr().String())
-	if err != nil {
-		t.Fatal(err)
-	}
-	defer conn2.Close()
+	plain := func(c net.Conn) net.Conn { return c }
 
-	accepted2, err := scl.Accept()
-	if err != nil {
-		t.Fatal(err)
+	// exchange sends payload from client to server, writing concurrently
+	// because a TLS client write waits for the server side of the handshake
+	exchange := func(client, server net.Conn, payload string) error {
+		written := make(chan error, 1)
+		go func() {
+			_, err := client.Write([]byte(payload))
+			written <- err
+		}()
+		if _, err := server.Read(make([]byte, len(payload))); err != nil {
+			return err
+		}
+		return <-written
 	}
-	defer accepted2.Close()
 
-	// First accepted connection should be closed by singleClientListener
-	buf := make([]byte, 1)
-	_, readErr := accepted1.Read(buf)
-	if readErr == nil {
-		t.Fatal("expected error reading from closed first connection")
+	tcpListener := func(t *testing.T) net.Listener {
+		t.Helper()
+		ln, err := net.Listen("tcp", "127.0.0.1:0")
+		require.NoError(t, err)
+		t.Cleanup(func() { ln.Close() })
+		return ln
 	}
+
+	t.Run("replaces the current connection once a new client sends data", func(t *testing.T) {
+		ln := tcpListener(t)
+		scl := newSingleClientListener(ln)
+
+		client1, server1 := connect(t, ln, scl, plain)
+		require.NoError(t, exchange(client1, server1, "x"))
+
+		client2, server2 := connect(t, ln, scl, plain)
+		require.NoError(t, exchange(client2, server2, "x"))
+
+		assert.Error(t, exchange(client1, server1, "x"), "expect first connection closed")
+	})
+
+	t.Run("keeps the current connection while a new client sends nothing", func(t *testing.T) {
+		ln := tcpListener(t)
+		scl := newSingleClientListener(ln)
+
+		client1, server1 := connect(t, ln, scl, plain)
+		require.NoError(t, exchange(client1, server1, "x"))
+
+		connect(t, ln, scl, plain)
+
+		assert.NoError(t, exchange(client1, server1, "x"))
+	})
+
+	t.Run("keeps the current connection when a TLS handshake fails", func(t *testing.T) {
+		ca, err := tlsutil.NewCAService("test")
+		require.NoError(t, err)
+		certPEM, keyPEM, err := ca.Issue("podvm")
+		require.NoError(t, err)
+		cert, err := tls.X509KeyPair(certPEM, keyPEM)
+		require.NoError(t, err)
+
+		ln := tcpListener(t)
+		scl := newSingleClientListener(tls.NewListener(ln, &tls.Config{Certificates: []tls.Certificate{cert}}))
+		withTLS := func(c net.Conn) net.Conn { return tls.Client(c, &tls.Config{InsecureSkipVerify: true}) }
+
+		client1, server1 := connect(t, ln, scl, withTLS)
+		require.NoError(t, exchange(client1, server1, "x"))
+
+		client2, server2 := connect(t, ln, scl, plain)
+		assert.Error(t, exchange(client2, server2, "GET / HTTP/1.0\r\n\r\n"), "expect plain TCP data to fail the handshake")
+
+		assert.NoError(t, exchange(client1, server1, "x"))
+	})
 }

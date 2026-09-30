@@ -24,11 +24,15 @@ import (
 var logger = log.New(log.Writer(), "[forwarder] ", log.LstdFlags|log.Lmsgprefix)
 
 // singleClientListener wraps a net.Listener to enforce single-client mode.
-// When a new connection arrives, the previous connection is closed so the
-// ttrpc server's stream state is cleanly reset for the new CAA instance.
+// When a new connection delivers its first data, the previous connection is
+// closed so the ttrpc server's stream state is cleanly reset for the new CAA instance.
 // The forwarder→kata-agent connection is NOT touched — it survives CAA restarts.
+//
+// Waiting for data means a TLS client must complete the handshake first, so a
+// stray TCP connection to the forwarder port cannot drop the CAA connection.
 type singleClientListener struct {
 	net.Listener
+
 	mu          sync.Mutex
 	currentConn net.Conn
 }
@@ -43,16 +47,34 @@ func (s *singleClientListener) Accept() (net.Conn, error) {
 		return nil, err
 	}
 
+	logger.Printf("Accepted connection from %s", conn.RemoteAddr())
+	return &singleClientConn{Conn: conn, listener: s}, nil
+}
+
+// promote makes conn the current client and closes the previous one.
+func (s *singleClientListener) promote(conn net.Conn) {
 	s.mu.Lock()
+	defer s.mu.Unlock()
+
 	if s.currentConn != nil {
 		logger.Printf("New connection from %s, closing previous connection", conn.RemoteAddr())
 		s.currentConn.Close()
 	}
 	s.currentConn = conn
-	s.mu.Unlock()
+}
 
-	logger.Printf("Accepted connection from %s", conn.RemoteAddr())
-	return conn, nil
+type singleClientConn struct {
+	net.Conn
+	listener *singleClientListener
+	promote  sync.Once
+}
+
+func (c *singleClientConn) Read(b []byte) (int, error) {
+	n, err := c.Conn.Read(b)
+	if n > 0 {
+		c.promote.Do(func() { c.listener.promote(c) })
+	}
+	return n, err
 }
 
 const (
