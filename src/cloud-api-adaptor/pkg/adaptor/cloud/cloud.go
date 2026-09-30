@@ -235,7 +235,26 @@ func (s *cloudService) restoreSandbox(ctx context.Context, sid string) {
 	}
 
 	logger.Printf("cleaning up incomplete sandbox %s", sid)
+	s.deleteAbandonedInstance(ctx, sid, st)
 	s.cleanupSandboxState(sid, st)
+}
+
+// deleteAbandonedInstance deletes the VM of a sandbox whose StartVM never
+// finished. The shim's StopVM for it fails on this CAA, which has no record of
+// the sandbox, so nothing else deletes the VM before the pod is deleted.
+func (s *cloudService) deleteAbandonedInstance(ctx context.Context, sid string, st *state.SandboxState) {
+	if st.InstanceID == "" || s.serverConfig.DeveloperMode {
+		return
+	}
+	if err := s.provider.DeleteInstance(ctx, st.InstanceID); err != nil {
+		logger.Printf("failed to delete instance %s of incomplete sandbox %s: %v", st.InstanceID, sid, err)
+		return
+	}
+	if s.ppService != nil {
+		if err := s.ppService.ReleasePeerPod(st.PodName, st.PodNamespace, st.InstanceID); err != nil {
+			logger.Printf("failed to release PeerPod %v", err)
+		}
+	}
 }
 
 // restoreWhenUnlocked restores sid once the process starting it has finished

@@ -11,6 +11,8 @@ import (
 	"net/url"
 	"os"
 	"path/filepath"
+	"slices"
+	"sync"
 	"testing"
 	"time"
 
@@ -29,7 +31,10 @@ import (
 	"github.com/confidential-containers/cloud-api-adaptor/src/cloud-providers/util/cloudinit"
 )
 
-type mockProvider struct{}
+type mockProvider struct {
+	mu      sync.Mutex
+	deleted []string
+}
 
 func (p *mockProvider) CreateInstance(ctx context.Context, podName, sandboxID string, cloudConfig cloudinit.CloudConfigGenerator, spec provider.InstanceTypeSpec) (*provider.Instance, error) {
 	return &provider.Instance{
@@ -42,6 +47,9 @@ func (p *mockProvider) CreateInstance(ctx context.Context, podName, sandboxID st
 }
 
 func (p *mockProvider) DeleteInstance(ctx context.Context, instanceID string) error {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.deleted = append(p.deleted, instanceID)
 	return nil
 }
 
@@ -193,6 +201,7 @@ func TestRecoverSandboxes(t *testing.T) {
 			PodName:      "mypod",
 			PodNamespace: "default",
 			NetNSPath:    netNSPath,
+			InstanceID:   "i-123",
 			InstanceIPs:  []string{"127.0.0.1"},
 			ServerName:   "podvm",
 		}))
@@ -200,17 +209,35 @@ func TestRecoverSandboxes(t *testing.T) {
 		return &ServerConfig{PodsDir: dir, ForwarderPort: forwarder.DefaultListenPort}, m
 	}
 
-	newService := func(cfg *ServerConfig) Service {
-		return NewService(&mockProvider{}, &mockProxyFactory{podsDir: cfg.PodsDir}, &mockWorkerNode{}, cfg)
+	newService := func(cfg *ServerConfig, p *mockProvider) Service {
+		return NewService(p, &mockProxyFactory{podsDir: cfg.PodsDir}, &mockWorkerNode{}, cfg)
+	}
+
+	deleted := func(p *mockProvider) []string {
+		p.mu.Lock()
+		defer p.mu.Unlock()
+		return slices.Clone(p.deleted)
 	}
 
 	t.Run("cleans up a sandbox abandoned mid-start", func(t *testing.T) {
 		cfg, m := saveStartingSandbox(t)
+		p := &mockProvider{}
 
-		newService(cfg)
+		newService(cfg, p)
 
 		_, err := m.Load(sandboxID)
 		assert.ErrorIs(t, err, os.ErrNotExist)
+		assert.Equal(t, []string{"i-123"}, deleted(p))
+	})
+
+	t.Run("keeps the instance of an abandoned sandbox in developer mode", func(t *testing.T) {
+		cfg, _ := saveStartingSandbox(t)
+		cfg.DeveloperMode = true
+		p := &mockProvider{}
+
+		newService(cfg, p)
+
+		assert.Nil(t, deleted(p))
 	})
 
 	t.Run("adopts a sandbox once another process finishes starting it", func(t *testing.T) {
@@ -218,10 +245,12 @@ func TestRecoverSandboxes(t *testing.T) {
 		lock, err := m.TryLock(sandboxID)
 		require.NoError(t, err)
 
-		s := newService(cfg)
+		p := &mockProvider{}
+		s := newService(cfg, p)
 
 		_, err = m.Load(sandboxID)
 		require.NoError(t, err, "expect state kept while another process is starting the sandbox")
+		assert.Nil(t, deleted(p), "expect instance kept while another process is starting the sandbox")
 
 		require.NoError(t, m.SetReady(sandboxID, nil))
 		require.NoError(t, lock.Close())
@@ -237,7 +266,8 @@ func TestRecoverSandboxes(t *testing.T) {
 		lock, err := m.TryLock(sandboxID)
 		require.NoError(t, err)
 
-		newService(cfg)
+		p := &mockProvider{}
+		newService(cfg, p)
 
 		_, err = m.Load(sandboxID)
 		require.NoError(t, err, "expect state kept while another process is starting the sandbox")
@@ -248,6 +278,7 @@ func TestRecoverSandboxes(t *testing.T) {
 			_, err := m.Load(sandboxID)
 			assert.ErrorIs(c, err, os.ErrNotExist)
 		}, 5*time.Second, 100*time.Millisecond)
+		assert.Equal(t, []string{"i-123"}, deleted(p))
 	})
 }
 
