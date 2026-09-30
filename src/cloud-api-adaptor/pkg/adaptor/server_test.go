@@ -33,11 +33,43 @@ func TestServerStartAndShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s, dir, socketPath, client, serverErrCh := testServerStart(t, ctx)
+	s, dir, socketPath, client, serverErrCh := testServerStart(t, ctx, &mockProvider{})
 	defer testServerShutdown(t, s, socketPath, dir, serverErrCh)
 	if _, err := client.Version(context.Background(), &pb.VersionRequest{}); err != nil {
 		t.Error(err)
 	}
+}
+
+func TestShutdownDuringStartVM(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	p := &mockProvider{creating: make(chan struct{}), release: make(chan struct{})}
+	_, _, _, client, serverErrCh := testServerStart(t, ctx, p)
+
+	id := uuid.New().String()
+	_, err := client.CreateVM(context.Background(), &pb.CreateVMRequest{
+		Id: id,
+		Annotations: map[string]string{
+			annotations.SandboxName:      "test",
+			annotations.SandboxNamespace: "test",
+		},
+	})
+	require.NoError(t, err)
+
+	startErr := make(chan error, 1)
+	go func() {
+		_, err := client.StartVM(context.Background(), &pb.StartVMRequest{Id: id})
+		startErr <- err
+	}()
+	<-p.creating
+
+	// SIGTERM cancels the context passed to Start
+	cancel()
+	close(p.release)
+
+	assert.NoError(t, <-startErr, "expect in-flight StartVM to finish during shutdown")
+	assert.NoError(t, <-serverErrCh)
 }
 
 func TestBuildAgentFactory(t *testing.T) {
@@ -89,7 +121,7 @@ func TestCreateStartAndStop(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
-	s, dir, socketPath, client, serverErrCh := testServerStart(t, ctx)
+	s, dir, socketPath, client, serverErrCh := testServerStart(t, ctx, &mockProvider{})
 	defer testServerShutdown(t, s, socketPath, dir, serverErrCh)
 	id := uuid.New().String()
 	if _, err := client.CreateVM(
@@ -128,12 +160,12 @@ func TestCreateStartAndStop(t *testing.T) {
 	}
 }
 
-func testServerStart(t *testing.T, ctx context.Context) (Server, string, string, pb.HypervisorService, chan error) {
+func testServerStart(t *testing.T, ctx context.Context, provider *mockProvider) (Server, string, string, pb.HypervisorService, chan error) {
 
 	dir := t.TempDir()
 
 	socketPath := filepath.Join(dir, "hypervisor.sock")
-	s := newServer(t, socketPath, filepath.Join(dir, "pods"))
+	s := newServer(t, socketPath, filepath.Join(dir, "pods"), provider)
 
 	serverErrCh := make(chan error)
 	go func() {
@@ -195,10 +227,9 @@ func startAgentServer(t *testing.T) string {
 	return port
 }
 
-func newServer(t *testing.T, socketPath, podsDir string) Server {
+func newServer(t *testing.T, socketPath, podsDir string, provider *mockProvider) Server {
 
 	port := startAgentServer(t)
-	provider := &mockProvider{}
 	serverConfig := &cloud.ServerConfig{
 		SocketPath:              socketPath,
 		PodsDir:                 podsDir,
@@ -247,9 +278,20 @@ func (n *mockWorkerNode) Teardown(nsPath string, config *tunneler.Config) error 
 type mockProvider struct {
 	primaryIP   string
 	secondaryIP string
+
+	// when set, CreateInstance closes creating and waits for release
+	creating chan struct{}
+	release  chan struct{}
 }
 
 func (p *mockProvider) CreateInstance(ctx context.Context, podName, sandboxID string, cloudConfig cloudinit.CloudConfigGenerator, spec provider.InstanceTypeSpec) (*provider.Instance, error) {
+	if p.release != nil {
+		close(p.creating)
+		<-p.release
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+	}
 
 	primaryIP := p.primaryIP
 	if primaryIP == "" {

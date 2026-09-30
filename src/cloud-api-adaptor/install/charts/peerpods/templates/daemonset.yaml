@@ -101,8 +101,9 @@ spec:
         - mountPath: /var/run/secrets/tokens
           name: vault-token
 {{- end }}
-      # On shutdown CAA drains all agent proxies in parallel, each for up to 30s.
-      terminationGracePeriodSeconds: 60
+      # On shutdown CAA waits up to 2m for in-flight calls such as StartVM, then
+      # drains all agent proxies in parallel, each for up to 30s.
+      terminationGracePeriodSeconds: 180
       hostNetwork: true
       dnsPolicy: ClusterFirstWithHostNet
       nodeSelector:

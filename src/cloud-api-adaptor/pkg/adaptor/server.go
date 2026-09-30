@@ -5,12 +5,14 @@ package adaptor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log"
 	"net"
 	"os"
 	"path/filepath"
 	"sync"
+	"time"
 
 	"github.com/containerd/ttrpc"
 	pbHypervisor "github.com/kata-containers/kata-containers/src/runtime/protocols/hypervisor"
@@ -30,6 +32,12 @@ var logger = log.New(log.Writer(), "[adaptor] ", log.LstdFlags|log.Lmsgprefix)
 const (
 	DefaultSocketPath = "/run/peerpod/hypervisor.sock"
 	DefaultPodsDir    = "/run/peerpod/pods"
+
+	// hypervisorShutdownTimeout bounds how long Shutdown waits for in-flight
+	// calls such as StartVM. When the new CAA only starts after this one exits,
+	// running pods have no agent proxy meanwhile, and their shims stop retrying
+	// after a few minutes.
+	hypervisorShutdownTimeout = 2 * time.Minute
 )
 
 type Server interface {
@@ -51,6 +59,56 @@ type server struct {
 	PeerPodsLimitPerNode    int
 	ownerUID                string
 	isOwner                 bool
+	calls                   *callTracker
+}
+
+// callTracker counts in-flight hypervisor calls so Shutdown can wait for
+// them. ttrpc.Server.Shutdown cannot: it treats a connection as idle until its
+// first response, so it closes the per-call connections the kata shim opens
+// and cancels their requests.
+type callTracker struct {
+	mu      sync.Mutex
+	active  int
+	closing bool
+	drained chan struct{}
+}
+
+func newCallTracker() *callTracker {
+	return &callTracker{drained: make(chan struct{})}
+}
+
+func (c *callTracker) intercept(ctx context.Context, unmarshal ttrpc.Unmarshaler, info *ttrpc.UnaryServerInfo, method ttrpc.Method) (interface{}, error) {
+	c.mu.Lock()
+	if c.closing {
+		c.mu.Unlock()
+		return nil, fmt.Errorf("cloud-api-adaptor is shutting down, rejecting %s", info.FullMethod)
+	}
+	c.active++
+	c.mu.Unlock()
+
+	defer func() {
+		c.mu.Lock()
+		defer c.mu.Unlock()
+		c.active--
+		if c.closing && c.active == 0 {
+			close(c.drained)
+		}
+	}()
+	return method(ctx, unmarshal)
+}
+
+// close rejects new calls and returns a channel that is closed once the
+// in-flight calls have returned.
+func (c *callTracker) close() <-chan struct{} {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	if !c.closing {
+		c.closing = true
+		if c.active == 0 {
+			close(c.drained)
+		}
+	}
+	return c.drained
 }
 
 // buildAgentFactory constructs a proxy.Factory, using persistent TLS material
@@ -101,6 +159,7 @@ func NewServer(provider provider.Provider, cfg *cloud.ServerConfig, workerNode p
 		enableCloudConfigVerify: cfg.EnableCloudConfigVerify,
 		PeerPodsLimitPerNode:    cfg.PeerPodsLimitPerNode,
 		ownerUID:                os.Getenv("POD_UID"),
+		calls:                   newCallTracker(),
 	}, nil
 }
 
@@ -119,7 +178,7 @@ func (s *server) Start(ctx context.Context) (err error) {
 		}
 	}
 
-	ttRPC, err := ttrpc.NewServer()
+	ttRPC, err := ttrpc.NewServer(ttrpc.WithUnaryServerInterceptor(s.calls.intercept))
 	if err != nil {
 		return err
 	}
@@ -144,7 +203,9 @@ func (s *server) Start(ctx context.Context) (err error) {
 	ttRPCErr := make(chan error)
 	go func() {
 		defer close(ttRPCErr)
-		if err := s.ttRPC.Serve(ctx, listener); err != nil {
+		// request contexts derive from this one; keep them alive on SIGTERM
+		// so Shutdown can let in-flight calls finish
+		if err := s.ttRPC.Serve(context.WithoutCancel(ctx), listener); err != nil && !errors.Is(err, ttrpc.ErrServerClosed) {
 			ttRPCErr <- err
 		}
 	}()
@@ -188,6 +249,21 @@ func (s *server) Shutdown() error {
 	s.stopOnce.Do(func() {
 		close(s.stopCh)
 	})
+
+	// let in-flight calls finish before draining the agent proxies (otherwise
+	// a StartVM in progress fails and the pod being created is retried)
+	select {
+	case <-s.calls.close():
+	case <-time.After(hypervisorShutdownTimeout):
+		logger.Printf("in-flight hypervisor calls did not finish within %v, cancelling them", hypervisorShutdownTimeout)
+		select {
+		case <-s.readyCh:
+			if err := s.ttRPC.Close(); err != nil {
+				logger.Printf("closing hypervisor service: %v", err)
+			}
+		default:
+		}
+	}
 
 	if k8sops.IsKubernetesEnvironment() {
 		isOwner, err := k8sops.RemoveExtendedResources(s.ownerUID)
