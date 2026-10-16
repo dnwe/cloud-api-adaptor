@@ -50,6 +50,10 @@ providerConfigs:
     # (default: "https://iam.cloud.ibm.com/identity/token")
     # IBMCLOUD_IAM_ENDPOINT: "https://iam.cloud.ibm.com/identity/token"
 
+    # Directory of a mounted ConfigMap to read IBMCLOUD_PODVM_IMAGE_ID, IBMCLOUD_PODVM_INSTANCE_PROFILE_NAME, IBMCLOUD_PODVM_INSTANCE_PROFILE_LIST and DISABLECVM from in place of their environment variables, and reload for new Pod VMs when they change
+    # (default: "")
+    # IBMCLOUD_PODVM_CONFIG_DIR: ""
+
     # List of Image IDs, comma separated
     # (required)
     IBMCLOUD_PODVM_IMAGE_ID: ""

@@ -32,6 +32,7 @@ func (*Manager) ParseCmd(flags *flag.FlagSet) {
 	reg.StringWithEnv(&ibmcloudVPCConfig.KeyID, "key-id", "", "IBMCLOUD_SSH_KEY_ID", "SSH Key ID")
 	reg.StringWithEnv(&ibmcloudVPCConfig.VpcID, "vpc-id", "", "IBMCLOUD_VPC_ID", "VPC ID")
 	reg.StringWithEnv(&ibmcloudVPCConfig.ClusterID, "cluster-id", "", "IBMCLOUD_CLUSTER_ID", "Cluster ID")
+	reg.StringWithEnv(&ibmcloudVPCConfig.PodVMConfigDir, "podvm-config-dir", "", "IBMCLOUD_PODVM_CONFIG_DIR", "Directory of a mounted ConfigMap to read IBMCLOUD_PODVM_IMAGE_ID, IBMCLOUD_PODVM_INSTANCE_PROFILE_NAME, IBMCLOUD_PODVM_INSTANCE_PROFILE_LIST and DISABLECVM from in place of their environment variables, and reload for new Pod VMs when they change")
 
 	reg.BoolWithEnv(&ibmcloudVPCConfig.DisableCVM, "disable-cvm", true, "DISABLECVM", "Use non-CVMs for peer pods")
 

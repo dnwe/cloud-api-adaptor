@@ -137,6 +137,7 @@ type Config struct {
 	Tags                     tags
 	DedicatedHostIDs         dedicatedHostIDs
 	DedicatedHostGroupIDs    dedicatedHostGroupIDs
+	PodVMConfigDir           string
 
 	selectedDedicatedHostID      string
 	selectedDedicatedHostGroupID string

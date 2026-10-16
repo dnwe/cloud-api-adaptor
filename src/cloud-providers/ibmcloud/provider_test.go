@@ -7,9 +7,14 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io/fs"
 	"net/http"
+	"os"
+	"path/filepath"
 	"strings"
+	"sync/atomic"
 	"testing"
+	"testing/synctest"
 	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
@@ -28,6 +33,8 @@ type mockVPC struct {
 	// getInstance, when set, replaces the default GetInstanceWithContext response
 	getInstance func(call int) *vpcv1.Instance
 	getCalls    int
+	// flakyImagesDown, when set, makes GetImageWithContext fail for IDs starting with "flaky"
+	flakyImagesDown atomic.Bool
 }
 
 func readyNIC(id, address string) *vpcv1.NetworkInterfaceInstanceContextReference {
@@ -133,8 +140,14 @@ func (v *mockVPC) GetImageWithContext(context context.Context, options *vpcv1.Ge
 	if strings.HasPrefix(*imageID, "notfound") {
 		return nil, nil, fmt.Errorf("image not found")
 	}
+	if strings.HasPrefix(*imageID, "flaky") && v.flakyImagesDown.Load() {
+		return nil, &core.DetailedResponse{StatusCode: http.StatusServiceUnavailable}, fmt.Errorf("service unavailable")
+	}
 
 	arch := "amd64"
+	if strings.Contains(*imageID, "s390x") {
+		arch = "s390x"
+	}
 	os := "ubuntu"
 
 	return &vpcv1.Image{
@@ -669,4 +682,225 @@ func TestConfigVerifier(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestPodVMConfigReload(t *testing.T) {
+	writeConfig := func(t *testing.T, dir string, cfg map[string]string) {
+		t.Helper()
+		for key, value := range cfg {
+			require.NoError(t, os.WriteFile(filepath.Join(dir, key), []byte(value), 0o644))
+		}
+	}
+	// startProvider loads the Pod VM settings from dir over those the adaptor
+	// read from its environment, as NewProvider does
+	startProvider := func(t *testing.T, vpc *mockVPC, dir string) *ibmcloudVPCProvider {
+		t.Helper()
+		config := &Config{ProfileName: "bx2-2x8", ZoneName: "us-south-1", DisableCVM: true, PodVMConfigDir: dir}
+		require.NoError(t, config.Images.Set("env-image"))
+		loaded, err := loadPodVMConfig(config)
+		require.NoError(t, err)
+		p := &ibmcloudVPCProvider{vpc: vpc, globalTagging: &mockTagging{}, serviceConfig: config}
+		require.NoError(t, p.updateInstanceProfileSpecList())
+		require.NoError(t, p.updateImageList(t.Context()))
+		require.NoError(t, p.checkDefaultProfile())
+		p.startPodVMConfigReload(loaded)
+		t.Cleanup(func() { assert.NoError(t, p.Teardown()) })
+		return p
+	}
+	createInstance := func(t *testing.T, p *ibmcloudVPCProvider, vpc *mockVPC) *vpcv1.InstancePrototype {
+		t.Helper()
+		_, err := p.CreateInstance(t.Context(), "pod1", "999", &mockCloudConfig{}, provider.InstanceTypeSpec{})
+		require.NoError(t, err)
+		return vpc.prototype.(*vpcv1.InstancePrototype)
+	}
+	imageID := func(prototype *vpcv1.InstancePrototype) string {
+		return *prototype.Image.(*vpcv1.ImageIdentity).ID
+	}
+	pollOnce := func() {
+		time.Sleep(podVMConfigPollInterval)
+		synctest.Wait()
+	}
+
+	t.Run("the directory takes precedence over the environment", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image", podVMProfileNameKey: "bx2-2x8", podVMDisableCVMKey: "false"})
+			vpc := &mockVPC{}
+			p := startProvider(t, vpc, dir)
+
+			prototype := createInstance(t, p, vpc)
+			assert.Equal(t, "file-image", imageID(prototype))
+			assert.Equal(t, ptr(vpcv1.InstanceConfidentialComputeModeTdxConst), prototype.ConfidentialComputeMode)
+		})
+	})
+
+	t.Run("a missing setting takes its default", func(t *testing.T) {
+		dir := t.TempDir()
+		writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image"})
+		config := &Config{ProfileName: "bx2-2x8", DisableCVM: false, PodVMConfigDir: dir}
+
+		_, err := loadPodVMConfig(config)
+		require.NoError(t, err)
+		assert.Equal(t, "", config.ProfileName)
+		assert.True(t, config.DisableCVM)
+	})
+
+	t.Run("a missing directory fails startup", func(t *testing.T) {
+		_, err := loadPodVMConfig(&Config{PodVMConfigDir: filepath.Join(t.TempDir(), "missing")})
+		assert.ErrorIs(t, err, fs.ErrNotExist)
+	})
+
+	t.Run("new instances use a changed image", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image", podVMProfileNameKey: "bx2-2x8"})
+			vpc := &mockVPC{}
+			p := startProvider(t, vpc, dir)
+
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "new-image"})
+			pollOnce()
+			assert.Equal(t, "new-image", imageID(createInstance(t, p, vpc)))
+		})
+	})
+
+	t.Run("an unknown image keeps the previous config until it is fixed", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image", podVMProfileNameKey: "bx2-2x8"})
+			vpc := &mockVPC{}
+			p := startProvider(t, vpc, dir)
+
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "notfound-image"})
+			pollOnce()
+			assert.Equal(t, "file-image", imageID(createInstance(t, p, vpc)))
+
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "fixed-image"})
+			pollOnce()
+			assert.Equal(t, "fixed-image", imageID(createInstance(t, p, vpc)))
+		})
+	})
+
+	t.Run("an unknown instance profile keeps the previous config", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image", podVMProfileNameKey: "bx2-2x8"})
+			vpc := &mockVPC{}
+			p := startProvider(t, vpc, dir)
+
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "new-image", podVMProfileNameKey: "bx9-1x1"})
+			pollOnce()
+			prototype := createInstance(t, p, vpc)
+			assert.Equal(t, "file-image", imageID(prototype))
+			assert.Equal(t, "bx2-2x8", *prototype.Profile.(*vpcv1.InstanceProfileIdentity).Name)
+		})
+	})
+
+	t.Run("an unknown default instance profile keeps the previous config", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image", podVMProfileNameKey: "bx2-2x8", podVMProfileListKey: "bx2-2x8"})
+			vpc := &mockVPC{}
+			p := startProvider(t, vpc, dir)
+
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "new-image", podVMProfileNameKey: "bx9-1x1"})
+			pollOnce()
+			prototype := createInstance(t, p, vpc)
+			assert.Equal(t, "file-image", imageID(prototype))
+			assert.Equal(t, "bx2-2x8", *prototype.Profile.(*vpcv1.InstanceProfileIdentity).Name)
+		})
+	})
+
+	t.Run("an image that cannot be looked up is retried", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image,flaky-s390x-image", podVMProfileNameKey: "bx2-2x8"})
+			vpc := &mockVPC{}
+			vpc.flakyImagesDown.Store(true)
+			p := startProvider(t, vpc, dir)
+			s390x := provider.InstanceTypeSpec{Arch: "s390x"}
+
+			_, err := p.CreateInstance(t.Context(), "pod1", "999", &mockCloudConfig{}, s390x)
+			require.Error(t, err)
+
+			vpc.flakyImagesDown.Store(false)
+			pollOnce()
+			_, err = p.CreateInstance(t.Context(), "pod1", "999", &mockCloudConfig{}, s390x)
+			require.NoError(t, err)
+			assert.Equal(t, "flaky-s390x-image", imageID(vpc.prototype.(*vpcv1.InstancePrototype)))
+
+			vpc.flakyImagesDown.Store(true)
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "new-image,flaky-s390x-image-2"})
+			pollOnce()
+			_, err = p.CreateInstance(t.Context(), "pod1", "999", &mockCloudConfig{}, s390x)
+			require.Error(t, err)
+
+			vpc.flakyImagesDown.Store(false)
+			pollOnce()
+			_, err = p.CreateInstance(t.Context(), "pod1", "999", &mockCloudConfig{}, s390x)
+			require.NoError(t, err)
+			assert.Equal(t, "flaky-s390x-image-2", imageID(vpc.prototype.(*vpcv1.InstancePrototype)))
+		})
+	})
+
+	t.Run("a rollback after an image could not be looked up is used", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			rollback := map[string]string{podVMImageIDKey: "file-image,s390x-image", podVMProfileNameKey: "bx2-2x8"}
+			writeConfig(t, dir, rollback)
+			vpc := &mockVPC{}
+			vpc.flakyImagesDown.Store(true)
+			p := startProvider(t, vpc, dir)
+			s390x := provider.InstanceTypeSpec{Arch: "s390x"}
+
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "new-image,flaky-s390x-image"})
+			pollOnce()
+			_, err := p.CreateInstance(t.Context(), "pod1", "999", &mockCloudConfig{}, s390x)
+			require.Error(t, err)
+
+			writeConfig(t, dir, rollback)
+			pollOnce()
+			_, err = p.CreateInstance(t.Context(), "pod1", "999", &mockCloudConfig{}, s390x)
+			require.NoError(t, err)
+			assert.Equal(t, "s390x-image", imageID(vpc.prototype.(*vpcv1.InstancePrototype)))
+		})
+	})
+
+	t.Run("a ConfigMap volume is read through its ..data symlink", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			// lay the directory out the way kubelet does, with each key a
+			// symlink through ..data to the current version's directory
+			writeVersion := func(version string, cfg map[string]string) {
+				require.NoError(t, os.Mkdir(filepath.Join(dir, version), 0o755))
+				writeConfig(t, filepath.Join(dir, version), cfg)
+				require.NoError(t, os.Symlink(version, filepath.Join(dir, "..data_tmp")))
+				require.NoError(t, os.Rename(filepath.Join(dir, "..data_tmp"), filepath.Join(dir, "..data")))
+			}
+			writeVersion("..v1", map[string]string{podVMImageIDKey: "file-image", podVMProfileNameKey: "bx2-2x8"})
+			for _, key := range podVMConfigKeys {
+				require.NoError(t, os.Symlink(filepath.Join("..data", key), filepath.Join(dir, key)))
+			}
+			vpc := &mockVPC{}
+			p := startProvider(t, vpc, dir)
+			assert.Equal(t, "file-image", imageID(createInstance(t, p, vpc)))
+
+			writeVersion("..v2", map[string]string{podVMImageIDKey: "new-image", podVMProfileNameKey: "bx2-2x8"})
+			require.NoError(t, os.RemoveAll(filepath.Join(dir, "..v1")))
+			pollOnce()
+			assert.Equal(t, "new-image", imageID(createInstance(t, p, vpc)))
+		})
+	})
+
+	t.Run("a removed directory keeps the previous config", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			dir := t.TempDir()
+			writeConfig(t, dir, map[string]string{podVMImageIDKey: "file-image", podVMProfileNameKey: "bx2-2x8"})
+			vpc := &mockVPC{}
+			p := startProvider(t, vpc, dir)
+
+			require.NoError(t, os.RemoveAll(dir))
+			pollOnce()
+			assert.Equal(t, "file-image", imageID(createInstance(t, p, vpc)))
+		})
+	})
 }

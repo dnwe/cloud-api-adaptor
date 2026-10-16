@@ -11,6 +11,7 @@ import (
 	"log"
 	"net/netip"
 	"os"
+	"sync/atomic"
 	"time"
 
 	"github.com/IBM/go-sdk-core/v5/core"
@@ -61,9 +62,22 @@ type ibmcloudVPCProvider struct {
 	globalTagging globalTaggingV1
 	cluster       clusterV2
 	serviceConfig *Config
+
+	// reloaded holds serviceConfig with the Pod VM settings last loaded from
+	// Config.PodVMConfigDir, and is nil when that is not set
+	reloaded   *atomic.Pointer[Config]
+	stopReload context.CancelFunc
 }
 
 func NewProvider(config *Config) (provider.Provider, error) {
+
+	var loaded podVMConfig
+	if config.PodVMConfigDir != "" {
+		var err error
+		if loaded, err = loadPodVMConfig(config); err != nil {
+			return nil, err
+		}
+	}
 
 	var authenticator core.Authenticator
 
@@ -207,6 +221,13 @@ func NewProvider(config *Config) (provider.Provider, error) {
 	}
 
 	logger.Printf("ibmcloud-vpc config: %#v", config.Redact())
+
+	if config.PodVMConfigDir != "" {
+		if err = provider.checkDefaultProfile(); err != nil {
+			return nil, err
+		}
+		provider.startPodVMConfigReload(loaded)
+	}
 
 	return provider, nil
 }
@@ -458,6 +479,7 @@ func getIPs(instance *vpcv1.Instance, instanceID string, numInterfaces int) ([]n
 }
 
 func (p *ibmcloudVPCProvider) CreateInstance(ctx context.Context, podName, sandboxID string, cloudConfig cloudinit.CloudConfigGenerator, spec provider.InstanceTypeSpec) (instance *provider.Instance, err error) {
+	p = p.current()
 
 	instanceName := util.GenerateInstanceName(podName, sandboxID, maxInstanceNameLen)
 
@@ -705,10 +727,14 @@ func (p *ibmcloudVPCProvider) DeleteInstance(ctx context.Context, instanceID str
 }
 
 func (p *ibmcloudVPCProvider) Teardown() error {
+	if p.stopReload != nil {
+		p.stopReload()
+	}
 	return nil
 }
 
 func (p *ibmcloudVPCProvider) ConfigVerifier() error {
+	p = p.current()
 	images := p.serviceConfig.Images.String()
 	if len(images) == 0 {
 		return fmt.Errorf("image-id is empty")
